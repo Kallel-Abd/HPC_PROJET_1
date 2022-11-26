@@ -4,11 +4,11 @@
 #include <stdio.h>
 #include <getopt.h>
 #include <err.h>
-#include <mpi.h>
+#include "/usr/include/x86_64-linux-gnu/mpi/mpi.h"
 
 #include "harmonics.h"
 
-int operation_count=0;
+#define root 0
 
 int lmax = -1;
 int npoint;
@@ -68,7 +68,6 @@ void process_command_line_options(int argc, char ** argv)
  */
 double norm(int n, double const *x)
 {
-	operation_count++;
    double rdwarf = 3.834e-20, rgiant = 1.304e19;
    double s1 = 0, s2 = 0, s3 = 0;
    double x1max = 0, x3max = 0;
@@ -134,7 +133,6 @@ void multiply_householder(int m, int n, double *v, double tau, double *c, int ld
 	}
 }
 
-
 /*
  * Compute a QR factorization of a real m-by-n matrix A (with m >= n).
  *
@@ -157,26 +155,125 @@ void multiply_householder(int m, int n, double *v, double tau, double *c, int ld
  * where tau[i] is a real scalar, and v is a real vector with v[0:i-1] = 0 and 
  * v[i] = 1; v[i+1:m] is stored on exit in A[i+1:m, i].
  */
-void QR_factorize(int m, int n, double * A, double * tau)
+void QR_factorize(int m, int n, double * A, double * tau, int rank, int size)
 {
+	double *V; // Used for multiply_householder
+	double aii, anorm;
+
+	int taille_block = n/size; // new n dimension for each processor
+
+	/*Send counts*/
+	int *send_count=NULL;
+	send_count=malloc(size);
+	for (int i = 0; i < size; i++)
+	{
+		send_count[i]=taille_block*m;
+	}
+	if (n%size != 0)
+	{
+		for (int i = 0; i < n%size; i++)
+		{
+			send_count[size-1-i]+=m;
+		}
+	}
+
+	// a table that contains the number of collumns for every A_block
+	int *column_count=NULL;
+	column_count=malloc(size);
+	for (int i = 0; i < size; i++)
+	{
+		column_count[i]=send_count[i]/m;
+	}
+
+	/*displs*/
+	int *displs=NULL;
+	displs=malloc(size);
+	int cursor=0;
+	for (int i = 0; i < size; i++)
+	{
+		displs[i]=cursor;
+		cursor+=send_count[i];
+	}
+	/*Recv buffer*/
+	long sub_matrix_size = sizeof(double) * send_count[rank] * m;
+	double *A_block = malloc(sub_matrix_size);
+
+	if (rank==root){
+	for (int i = 0; i < size; i++)
+	{
+		printf("%d\t",send_count[i]);
+	}
+	printf("\n%d",n/size);
+	printf("\n\n");
+	}
+	printf("begin scater\n");
+	MPI_Scatterv( A, send_count, displs, MPI_DOUBLE, A_block, send_count[rank], MPI_DOUBLE, root, MPI_COMM_WORLD);
+	if(rank == root)
+		printf("scater sucsessful .\n");
+
 	for (int i = 0; i < n; ++i) {
+
+		// Which processors contains the current collumn
+		int j=i,counter=-1;
+		while (j >= 0)
+		{
+			counter++;
+			j-=column_count[counter];
+		}
+		int rank_pivot = counter; 
+
+		int col_index = i; // Which co:umns i corresponds to in its processor
+		if (rank_pivot > 0){
+		for (int k = 0; k < rank_pivot; k++)
+		{
+			col_index-=column_count[k];
+		}
+		}
+
+		// Only done by the processor containing the current line
+		if(rank == rank_pivot){
+			aii = A_block[i + col_index * m];
+			anorm = -norm(m - i, &A_block[i + col_index * m]);
+			if (aii < 0)
+				anorm = -anorm;
+			tau[i] = (anorm - aii) / anorm;
+			for (int j = i + 1; j < m; j++)
+				A_block[col_index * m + j] /= (aii - anorm);
+
+			/* Apply H(i) to A(i:m,i+1:n) from the left */
+			A_block[i + col_index * m] = 1;
+		}
+
+		if(rank == rank_pivot){
+			V = &A_block[col_index * m + i];
+		}
+		else{
+			V = malloc((m-i)*sizeof(*V));
+		}
+		// Broadcasting all calculations to all processors
+		MPI_Bcast(V, m-i, MPI_DOUBLE, rank_pivot, MPI_COMM_WORLD);
+		MPI_Bcast(&tau[i], 1, MPI_DOUBLE, rank_pivot, MPI_COMM_WORLD);
 		
 		/* Generate elementary reflector H(i) to annihilate A(i+1:m,i) */
-		double aii = A[i + i * m];
-		double anorm = -norm(m - i, &A[i + i * m]);
-		if (aii < 0)
-			anorm = -anorm;
-		tau[i] = (anorm - aii) / anorm;
-		for (int j = i + 1; j < m; j++)
-			A[i * m + j] /= (aii - anorm);
+		if(rank >= rank_pivot){ // The lower ranks have already done all their calculations
+			if(rank == rank_pivot) // The current rank doesn't necessarely start at its first line
+				multiply_householder(m-i,column_count[rank_pivot] - col_index - 1, V, tau[i], &A_block[(col_index+1)*m + i],m);
+			else
+				multiply_householder(m-i,column_count[rank_pivot], V, tau[i], &A_block[i],m);
+		}
 
-		/* Apply H(i) to A(i:m,i+1:n) from the left */
-		A[i + i * m] = 1;
-        	multiply_householder(m-i, n-i-1, &A[i*m + i], tau[i], &A[(i+1)*m + i], m);
-		A[i + i * m] = anorm;
+		if(rank == rank_pivot)
+			A_block[i + col_index * m] = anorm;
+		else
+			free(V);
 	}
-}
 
+
+	MPI_Gatherv(A_block,send_count[rank],MPI_DOUBLE,A,send_count,displs,MPI_DOUBLE,root,MPI_COMM_WORLD);
+	if(rank == root)
+		printf("Gather sucessful.\n");
+
+}
 
 /*
  * Overwrite vector c with transpose(Q) * c where Q is a
@@ -232,150 +329,135 @@ void triangular_solve(int n, const double *U, int ldu, double *b)
  * vector; the residual sum of squares for the solution is given by the sum of 
  * squares of b[n:m].
  */
-void linear_least_squares(int m, int n, double *A, double *b)
+void linear_least_squares(int m, int n, double *A, double *b, int rank, int p)
 {
 	assert(m >= n);
-	int rank;
-	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-
 
 	double tau[n];
-	QR_factorize(m, n, A, tau);                    /* QR factorization of A */
-	multiply_Qt(m, n, A, tau, b);                /* B[0:m] := Q**T * B[0:m] */
-	triangular_solve(n, A, m, b);              /* B[0:n] := inv(R) * B[0:n] */
 
+	double start = wtime();
+	double t;
+
+	// Parallelized version of QR_factorize
+	if(rank == root) printf("Entering QR_factorize...\n");
+	QR_factorize(m, n, A, tau, rank, p);                    /* QR factorization of A */
+	if(rank == root){
+		printf("QR_factorize ended succesfully !\n");
+		t = wtime()  - start;
+		printf("QR_factorize completed in %.1f\n", t);
+	}
+	// Sequential version since its calculation time aren't a problem
+	// compared to QR_factorize
+	if (rank == root){
+		start = wtime();
+		multiply_Qt(m, n, A, tau, b); /* B[0:m] := Q**T * B[0:m] */
+		t = wtime() - start;
+		printf("multiply_Qt completed in %.1f\n", t);
+
+		start = wtime();
+		triangular_solve(n, A, m, b); /* B[0:n] := inv(R) * B[0:n] */
+		t = wtime() - start;
+		printf("triangular_solve completed in %.1f\n", t);
+	}
 }
 
 /*****************************************************************************/
 
 int main(int argc, char ** argv)
-{	
-	int size,rank;
-    MPI_Init(NULL,NULL);
-    MPI_Comm_size(MPI_COMM_WORLD, &size);
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+{
+	MPI_Init(NULL,NULL);
+	int rank,p;
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	MPI_Comm_size(MPI_COMM_WORLD, &p);
 
 	process_command_line_options(argc, argv);
 
 	/* preparations and memory allocation */
 	int nvar = (lmax + 1) * (lmax + 1);
-	if ( rank== 0 )
+	if(rank == root){
+		printf("Number of CPUs : %d\n",p);
 		printf("Linear Least Squares with dimension %d x %d\n", npoint, nvar);
-	if (nvar > npoint)
-		errx(1, "not enough data points");
+		if (nvar > npoint)
+			errx(1, "not enough data points");
 
-	long matrix_size = sizeof(double) * nvar * npoint;
-	
-	if ( rank== 0 ){
-		char hsize[16];
-		human_format(hsize, matrix_size);
-		printf("Matrix size: %sB\n", hsize);
 	}
 
-	double *A = malloc(matrix_size);
+	long matrix_size = sizeof(double) * nvar * npoint;
+	double *A = NULL;
+	double *P, *v;
+	struct data_points data;
+	double FLOP = 0;
+	double start = 0;
+
+	char hsize[16];
+	human_format(hsize, matrix_size);
+	if(rank==root) printf("Matrix size: %sB\n", hsize);
+	A = malloc(matrix_size);
 	if (A == NULL)
 		err(1, "cannot allocate matrix");
 
-	double * P = malloc((lmax + 1) * (lmax + 1) * sizeof(*P));
-	double * v = malloc(npoint * sizeof(*v));
+	P = malloc((lmax + 1) * (lmax + 1) * sizeof(*P));
+	v = malloc(npoint * sizeof(*v));
 	if (P == NULL || v == NULL)
 		err(1, "cannot allocate data points\n");
 
-	if (rank==0)
-		printf("Reading data points from %s\n", data_filename);
-	struct data_points data;
+	if(rank == root) printf("Reading data points from %s\n", data_filename);
 	load_data_points(data_filename, npoint, &data);
-	if (rank == 0){
-	printf("Successfully read %d data points\n", npoint);
-	
-	printf("Building matrix\n");
-	}
+	if(rank == root) printf("Successfully read %d data points\n", npoint);	
+	if(rank == root) printf("Building matrix\n");
 	struct spherical_harmonics model;
 	setup_spherical_harmonics(lmax, &model);
-
-	for (int i = 0; i < npoint; i++) {
-		computeP(&model, P, sin(data.phi[i]));
-		
-		for (int l = 0; l <= lmax; l++) {
-			/* zonal term */
-			A[i + npoint * CT(l, 0)] = P[PT(l, 0)];
 	
-			/* tesseral terms */
-			for (int m = 1; m <= l; m++) {
-				A[i + npoint * CT(l, m)] = P[PT(l, m)] * cos(m * data.lambda[i]);
-				A[i + npoint * ST(l, m)] = P[PT(l, m)] * sin(m * data.lambda[i]);
+	if(rank == root){
+		for (int i = 0; i < npoint; i++) {
+			computeP(&model, P, sin(data.phi[i]));
+			
+			for (int l = 0; l <= lmax; l++) {
+				/* zonal term */
+				A[i + npoint * CT(l, 0)] = P[PT(l, 0)];
+		
+				/* tesseral terms */
+				for (int m = 1; m <= l; m++) {
+					A[i + npoint * CT(l, m)] = P[PT(l, m)] * cos(m * data.lambda[i]);
+					A[i + npoint * ST(l, m)] = P[PT(l, m)] * sin(m * data.lambda[i]);
+				}
 			}
 		}
 	}
+
 	
-	double FLOP = 2. * nvar * nvar * npoint;
-	if(rank == 0){
-		char hflop[16];
-		human_format(hflop, FLOP);
-		printf("Least Squares (%sFLOP)\n", hflop);
-	}
-	double start = wtime();
+	FLOP = 2. * nvar * nvar * npoint;
+	char hflop[16];
+	human_format(hflop, FLOP);
+	if(rank == root) printf("Least Squares (%sFLOP)\n", hflop);
+	start = wtime();
 
-	/*Send counts*/
-	int *send_count=NULL;
-	send_count=malloc(size);
-	for (int i = 0; i < size; i++)
-	{
-		send_count[i]=nvar/size;
-	}
-	if (nvar%size != 0)
-	{
-		for (int i = 0; i < nvar%size; i++)
-		{
-			send_count[size-1-i]++;
-		}
-	}
-
-	/*displs*/
-	int *displs=NULL;
-	displs=malloc(size);
-	int cursor=0;
-	for (int i = 0; i < size; i++)
-	{
-		displs[i]=cursor;
-		cursor+=send_count[i];
-	}
-
-	/*Recv buffer*/
-	long sub_matrix_size = sizeof(double) * send_count[rank] * npoint;
-	double *sub_A = malloc(sub_matrix_size);
-
-	/*Result buffer*/
-
-	int root=0;
-	MPI_Scatterv( A, send_count, displs, MPI_DOUBLE, sub_A, send_count[rank], MPI_DOUBLE, root, MPI_COMM_WORLD);
+	/* the real action takes place here */
+	linear_least_squares(npoint, nvar, A, data.V, rank, p);
 	
-	linear_least_squares(npoint, send_count[rank], sub_A, data.V);
-
-	MPI_Gatherv( data.V, send_count[rank], MPI_DOUBLE, data.V, send_count, displs, MPI_DOUBLE, root, MPI_COMM_WORLD);
-	
-	double t = wtime()  - start;
-	double FLOPS = FLOP / t;
-	if(rank==0){
+	if(rank == root){
+		double t = wtime()  - start;
+		double FLOPS = FLOP / t;
 		char hflops[16];
 		human_format(hflops, FLOPS);
 		printf("Completed in %.1f s (%s FLOPS)\n", t, hflops);
-	
-	double res = 0;
-	for (int j = nvar; j < npoint; j++)
-		res += data.V[j] * data.V[j];
-	printf("residual sum of squares %g\n", res);
-
-	printf("Saving model in %s\n", model_filename);
-	FILE *g = fopen(model_filename, "w");
-	if (g == NULL)
-		err(1, "cannot open %s for writing\n", model_filename);
-	for (int l = 0; l <= lmax; l++) {
-		fprintf(g, "%d\t0\t%.18g\t0\n", l, data.V[CT(l, 0)]);
-		for (int m = 1; m <= l; m++)
-			fprintf(g, "%d\t%d\t%.18g\t%.18g\n", l, m, data.V[CT(l, m)], data.V[ST(l, m)]);
-	}
-	printf("operation count = %d\n",operation_count);
+		double res = 0;
+		for (int j = nvar; j < npoint; j++)
+			res += data.V[j] * data.V[j];
+		printf("residual sum of squares %g\n", res);
+		printf("Saving model in %s\n", model_filename);
+		FILE *g = fopen(model_filename, "w");
+		if (g == NULL)
+			err(1, "cannot open %s for writing\n", model_filename);
+		for (int l = 0; l <= lmax; l++) {
+			fprintf(g, "%d\t0\t%.18g\t0\n", l, data.V[CT(l, 0)]);
+			for (int m = 1; m <= l; m++)
+				fprintf(g, "%d\t%d\t%.18g\t%.18g\n", l, m, data.V[CT(l, m)], data.V[ST(l, m)]);
+		}
+		FILE *data_result = fopen("data_result.txt", "a");
+		fprintf(data_result, "%d %d %.1f\n", npoint, lmax, t);
+		fclose(data_result);
 	}
 	MPI_Finalize();
+	exit(EXIT_SUCCESS);
 }
